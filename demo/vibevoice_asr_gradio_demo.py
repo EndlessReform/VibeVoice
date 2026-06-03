@@ -211,7 +211,27 @@ class VibeVoiceASRInference:
         
         # Text tokens = total - speech - padding
         num_text_tokens = total_input_tokens - num_speech_tokens - num_padding_tokens
-        
+
+        # --- Debug dump: input token tensor as npz ---
+        dump_prefix = f"dump_{int(time.time())}_{os.getpid()}"
+        npz_path = f"{dump_prefix}_input_tokens.npz"
+        np.savez(npz_path, input_ids=input_ids.cpu().numpy())
+        print(f"[DEBUG] Saved input tokens to {npz_path}")
+
+        # --- Debug dump: build prompt text with audio stubbed as <audio> ---
+        prompt_text_parts = []
+        in_speech = False
+        for token_id in input_ids_list:
+            if token_id == speech_start_id:
+                in_speech = True
+                prompt_text_parts.append("<audio>")
+            elif token_id == speech_end_id:
+                in_speech = False
+            elif not in_speech and token_id != pad_id:
+                decoded = self.processor.tokenizer.decode([token_id], skip_special_tokens=True)
+                prompt_text_parts.append(decoded)
+        prompt_text = "".join(prompt_text_parts)
+
         with torch.no_grad():
             output_ids = self.model.generate(
                 **inputs,
@@ -223,7 +243,15 @@ class VibeVoiceASRInference:
         # Decode output
         generated_ids = output_ids[0, inputs['input_ids'].shape[1]:]
         generated_text = self.processor.decode(generated_ids, skip_special_tokens=True)
-        
+
+        # --- Debug dump: prompt + output as txt ---
+        txt_path = f"{dump_prefix}_prompt_output.txt"
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            f.write(prompt_text)
+            f.write("\n===OUTPUT===\n")
+            f.write(generated_text)
+        print(f"[DEBUG] Saved prompt+output to {txt_path}")
+
         # Parse structured output
         try:
             transcription_segments = self.processor.post_process_transcription(generated_text)

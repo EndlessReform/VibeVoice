@@ -176,3 +176,11 @@ tags
 exp
 .gradio/
 experimental_voices
+
+# My stuff
+dump*
+out/
+
+# Generated audio feature artifacts
+flight*.npz
+flight.wav
