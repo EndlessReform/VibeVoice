@@ -142,6 +142,7 @@ You are a helpful assistant that transcribes audio input into text output in JSO
 This is a {duration_seconds:.2f} seconds audio, with extra info: {hotwords_or_context}
 
 Please transcribe it with these keys: Start time, End time, Speaker ID, Content<|im_end|>
+<|im_start|>assistant
 ```
 
 Without hotwords or context, use this user suffix instead:
@@ -153,9 +154,9 @@ This is a {duration_seconds:.2f} seconds audio, please transcribe it with these 
 Important details:
 
 - The prefix uses two independent chat blocks: one `system` block followed by
-  one `user` block.
-- The ASR processor does not append `<|im_start|>assistant\n`; generation starts
-  after the final user `<|im_end|>\n`.
+  one `user` block, followed by the open assistant generation marker.
+- With `add_generation_prompt=True`, the ASR processor appends
+  `<|im_start|>assistant\n`; generation starts after that marker.
 - The audio span is represented in text as one `<|object_ref_start|>`, followed
   by `ceil(num_audio_samples / 3200)` copies of `<|box_start|>`, followed by
   one `<|object_ref_end|>`.
@@ -212,7 +213,7 @@ def build_asr_prefix(num_audio_samples: int, extra_info: str | None = None) -> s
         )
 
     user_text = render_asr_chat("user", audio_text + "\n" + user_suffix)
-    return system_text + user_text
+    return system_text + user_text + "<|im_start|>assistant\n"
 
 
 tokenizer = Tokenizer.from_file("./vibevoice-asr-text-tokenizer/tokenizer.json")
@@ -236,6 +237,7 @@ You are a helpful assistant that transcribes audio input into text output in JSO
 This is a 1.00 seconds audio, with extra info: Hotwords: VibeVoice, Qwen2.5, CUDA graphs.
 
 Please transcribe it with these keys: Start time, End time, Speaker ID, Content<|im_end|>
+<|im_start|>assistant
 ```
 
 When using the exported tokenizer with bare `tokenizers`, that is the only

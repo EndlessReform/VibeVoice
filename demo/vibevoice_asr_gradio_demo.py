@@ -80,7 +80,7 @@ class VibeVoiceASRInference:
             # MPS: load onto CPU first, then move (device_map="mps" is not supported)
             self.model = VibeVoiceASRForConditionalGeneration.from_pretrained(
                 model_path,
-                dtype=dtype,
+                torch_dtype=dtype,
                 device_map=None,
                 attn_implementation=attn_implementation,
                 trust_remote_code=True
@@ -89,7 +89,7 @@ class VibeVoiceASRInference:
         elif device == "auto":
             self.model = VibeVoiceASRForConditionalGeneration.from_pretrained(
                 model_path,
-                dtype=dtype,
+                torch_dtype=dtype,
                 device_map="auto",
                 attn_implementation=attn_implementation,
                 trust_remote_code=True
@@ -97,7 +97,7 @@ class VibeVoiceASRInference:
         else:
             self.model = VibeVoiceASRForConditionalGeneration.from_pretrained(
                 model_path,
-                dtype=dtype,
+                torch_dtype=dtype,
                 device_map=device if device != "auto" else None,
                 attn_implementation=attn_implementation,
                 trust_remote_code=True
@@ -109,7 +109,10 @@ class VibeVoiceASRInference:
         
         # Print model info
         total_params = sum(p.numel() for p in self.model.parameters())
+        first_float_param = next((p for p in self.model.parameters() if p.is_floating_point()), None)
+        param_dtype = first_float_param.dtype if first_float_param is not None else "unknown"
         print(f"✅ Model loaded successfully on {self.device}")
+        print(f"🔢 First floating parameter dtype: {param_dtype}")
         print(f"📊 Total parameters: {total_params:,} ({total_params/1e9:.2f}B)")
     
     def transcribe(
@@ -212,11 +215,37 @@ class VibeVoiceASRInference:
         # Text tokens = total - speech - padding
         num_text_tokens = total_input_tokens - num_speech_tokens - num_padding_tokens
 
-        # --- Debug dump: input token tensor as npz ---
-        dump_prefix = f"dump_{int(time.time())}_{os.getpid()}"
-        npz_path = f"{dump_prefix}_input_tokens.npz"
-        np.savez(npz_path, input_ids=input_ids.cpu().numpy())
-        print(f"[DEBUG] Saved input tokens to {npz_path}")
+        # --- Ground Truth Prefix Dump ---
+        # Replicate the internal model logic to get the exact prefix tensor
+        with torch.no_grad():
+            # 1. Get text embeddings for all tokens (including placeholders)
+            input_ids_tensor = inputs['input_ids']
+            text_embeds = self.model.get_input_embeddings()(input_ids_tensor).float()
+            
+            # 2. Encode the audio to get features
+            audio_features = self.model.encode_speech(
+                speech_tensors=inputs['speech_tensors'],
+                speech_masks=inputs['speech_masks']
+            ).float()
+            
+            # 3. Splice audio features into the text embeddings
+            # acoustic_input_mask is True where <|box_start|> tokens are
+            prefix_embeds = text_embeds.clone()
+            prefix_embeds[inputs['acoustic_input_mask']] = audio_features.reshape(-1, audio_features.shape[-1])
+            
+        os.makedirs("out", exist_ok=True)
+        dump_prefix = f"gt_prefix_{int(time.time())}_{os.getpid()}"
+        npz_path = f"out/{dump_prefix}.npz"
+        np.savez(
+            npz_path,
+            input_ids=input_ids.cpu().numpy(),
+            attention_mask=inputs['attention_mask'][0].cpu().numpy(),
+            acoustic_input_mask=inputs['acoustic_input_mask'][0].cpu().numpy(),
+            speech_masks=inputs['speech_masks'][0].cpu().numpy(),
+            audio_features=audio_features.cpu().numpy(),
+            inputs_embeds=prefix_embeds[0].cpu().numpy()
+        )
+        print(f"[DEBUG] Saved GROUND TRUTH prefix to {npz_path}")
 
         # --- Debug dump: build prompt text with audio stubbed as <audio> ---
         prompt_text_parts = []

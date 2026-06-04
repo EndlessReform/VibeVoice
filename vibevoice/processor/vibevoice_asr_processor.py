@@ -369,7 +369,8 @@ class VibeVoiceASRProcessor:
         
         user_tokens = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": user_input_string}],
-            tokenize=True
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
         )
         
         # Combine tokens

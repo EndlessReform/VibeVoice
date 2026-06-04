@@ -184,3 +184,4 @@ out/
 # Generated audio feature artifacts
 flight*.npz
 flight.wav
+!tests/fixtures/asr/*

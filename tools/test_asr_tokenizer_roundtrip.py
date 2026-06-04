@@ -114,7 +114,10 @@ def build_rendered_prompt(
         + "\n"
         + build_user_suffix(case.samples, case.context_info)
     )
-    user_text = render_asr_chat([{"role": "user", "content": user_input}])
+    user_text = render_asr_chat(
+        [{"role": "user", "content": user_input}],
+        add_generation_prompt=True,
+    )
 
     return system_text, user_text, vae_tok_len
 

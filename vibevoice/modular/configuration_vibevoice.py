@@ -16,16 +16,22 @@ def _convert_dtype_to_string(config_dict: dict) -> dict:
     Convert torch.dtype objects to their string representation for JSON serialization.
     
     This fixes the "Object of type dtype is not JSON serializable" error that occurs
-    when transformers tries to log/serialize the config with torch_dtype as a torch.dtype object.
+    when transformers tries to log/serialize configs containing torch.dtype objects.
     
     See: https://github.com/microsoft/VibeVoice/issues/199
     """
-    if "torch_dtype" in config_dict and config_dict["torch_dtype"] is not None:
-        dtype = config_dict["torch_dtype"]
-        if isinstance(dtype, torch.dtype):
-            # Convert torch.dtype to string (e.g., torch.bfloat16 -> "bfloat16")
-            config_dict["torch_dtype"] = str(dtype).replace("torch.", "")
-    return config_dict
+    def convert(value):
+        if isinstance(value, torch.dtype):
+            return str(value).replace("torch.", "")
+        if isinstance(value, dict):
+            return {key: convert(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(convert(item) for item in value)
+        return value
+
+    return convert(config_dict)
 
 
 class VibeVoiceAcousticTokenizerConfig(PretrainedConfig):
