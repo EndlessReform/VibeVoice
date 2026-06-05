@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 from safetensors import safe_open
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, Qwen2TokenizerFast
 
 from vibevoice.modular.configuration_vibevoice import VibeVoiceASRConfig
 from vibevoice.modular.modeling_vibevoice import SpeechConnector
@@ -23,9 +23,13 @@ from vibevoice.modular.modular_vibevoice_tokenizer import (
 from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
 
 
-DEFAULT_ASR_REPO = "microsoft/VibeVoice-ASR"
-DEFAULT_ASR_REVISION = "d0c9efdb8d614685062c04425d91e01b6f37d944"
-DEFAULT_TEXTONLY_MODEL_PATH = Path("out/textonly-checkpoint")
+DEFAULT_ASR_PREFIX_BUNDLE = "jkeisling/vibevoice-asr-encoder"
+DEFAULT_AUDIO_ENCODER_FILE = "audio_encoder.safetensors"
+WTE_KEYS = (
+    "model.language_model.embed_tokens.weight",
+    "model.language_model.model.embed_tokens.weight",
+    "model.embed_tokens.weight",
+)
 ACOUSTIC_TOKENIZER_PREFIX = "model.acoustic_tokenizer."
 ACOUSTIC_CONNECTOR_PREFIX = "model.acoustic_connector."
 SEMANTIC_TOKENIZER_PREFIX = "model.semantic_tokenizer."
@@ -33,7 +37,7 @@ SEMANTIC_CONNECTOR_PREFIX = "model.semantic_connector."
 
 
 def default_model_path() -> str:
-    return DEFAULT_ASR_REPO
+    return DEFAULT_ASR_PREFIX_BUNDLE
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,36 +51,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-path",
         default=default_model_path(),
-        help="HF repo id or local VibeVoice-ASR checkpoint directory.",
-    )
-    parser.add_argument(
-        "--revision",
-        default=DEFAULT_ASR_REVISION,
-        help="HF hub revision (commit hash, branch, or tag).",
-    )
-    parser.add_argument(
-        "--textonly-model-path",
-        default=str(DEFAULT_TEXTONLY_MODEL_PATH),
         help=(
-            "Local text-only LM checkpoint containing tokenizer files and "
-            "model.embed_tokens.weight. Defaults to out/textonly-checkpoint."
+            "HF repo id or local ASR prefix bundle containing audio_encoder.safetensors, "
+            "tokenizer files, and embedded WTE."
         ),
     )
     parser.add_argument(
         "--tokenizer-path",
         default=None,
         help=(
-            "Optional tokenizer directory. Defaults to --textonly-model-path when "
-            "that directory has tokenizer files, otherwise --language-model."
-        ),
-    )
-    parser.add_argument(
-        "--language-model",
-        default="Qwen/Qwen2.5-7B",
-        help=(
-            "Fallback tokenizer path when no local tokenizer directory is available. "
-            "For runtime prefix export this tokenizer must already include the ASR "
-            "speech tokens."
+            "Optional tokenizer directory. Defaults to --model-path and must contain "
+            "the pre-merged ASR tokenizer files."
         ),
     )
     parser.add_argument(
@@ -129,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--local-files-only",
         action="store_true",
-        help="Resolve Hugging Face files from the local cache only.",
+        help="Resolve Hugging Face bundle files from the local cache only.",
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -150,9 +135,19 @@ def parse_args() -> argparse.Namespace:
         "--compare-demo-path",
         action="store_true",
         help=(
-            "Also load the full ASR model and compare against the exact demo "
+            "Also load --reference-model-path and compare against the exact demo "
             "model.get_input_embeddings()+model.encode_speech path."
         ),
+    )
+    parser.add_argument(
+        "--reference-model-path",
+        default=None,
+        help="Optional full ASR checkpoint used only with --compare-demo-path.",
+    )
+    parser.add_argument(
+        "--reference-revision",
+        default=None,
+        help="Optional revision for --reference-model-path.",
     )
     parser.add_argument(
         "--atol",
@@ -174,7 +169,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_checkpoint_dir(model_path: str, local_files_only: bool, revision: str = None) -> Path:
+def resolve_checkpoint_dir(model_path: str, local_files_only: bool) -> Path:
     path = Path(model_path).expanduser()
     if path.exists():
         return path
@@ -184,11 +179,18 @@ def resolve_checkpoint_dir(model_path: str, local_files_only: bool, revision: st
     return Path(
         snapshot_download(
             repo_id=model_path,
-            revision=revision,
             allow_patterns=[
                 "config.json",
-                "model.safetensors.index.json",
-                "model-*.safetensors",
+                "bundle_config.json",
+                "audio_encoder_config.json",
+                DEFAULT_AUDIO_ENCODER_FILE,
+                "added_tokens.json",
+                "merges.txt",
+                "special_tokens_map.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "vocab.json",
+                "vibevoice_asr_tokenizer_export.json",
             ],
             local_files_only=local_files_only,
         )
@@ -196,9 +198,24 @@ def resolve_checkpoint_dir(model_path: str, local_files_only: bool, revision: st
 
 
 def load_prefixed_weights(module: torch.nn.Module, checkpoint_dir: Path, prefix: str) -> None:
+    bundle_weights = checkpoint_dir / DEFAULT_AUDIO_ENCODER_FILE
+    if bundle_weights.exists():
+        with safe_open(bundle_weights, framework="pt", device="cpu") as handle:
+            selected = [key for key in handle.keys() if key.startswith(prefix)]
+            if not selected:
+                raise ValueError(f"No audio bundle weights found for prefix {prefix!r}")
+            state_dict = {
+                key.removeprefix(prefix): handle.get_tensor(key)
+                for key in selected
+            }
+        module.load_state_dict(state_dict, strict=True)
+        return
+
     index_path = checkpoint_dir / "model.safetensors.index.json"
     if not index_path.exists():
-        raise FileNotFoundError(f"Missing checkpoint index: {index_path}")
+        raise FileNotFoundError(
+            f"Missing {DEFAULT_AUDIO_ENCODER_FILE} or checkpoint index in {checkpoint_dir}"
+        )
 
     with index_path.open("r", encoding="utf-8") as handle:
         weight_map = json.load(handle)["weight_map"]
@@ -216,6 +233,56 @@ def load_prefixed_weights(module: torch.nn.Module, checkpoint_dir: Path, prefix:
                 state_dict[key.removeprefix(prefix)] = shard.get_tensor(key)
 
     module.load_state_dict(state_dict, strict=True)
+
+
+def infer_bundle_config(checkpoint_dir: Path) -> tuple[int, int | None, int, int]:
+    hidden_size = 3584
+    vocab_size = None
+    acoustic_vae_dim = 64
+    semantic_vae_dim = 128
+
+    bundle_weights = checkpoint_dir / DEFAULT_AUDIO_ENCODER_FILE
+    if not bundle_weights.exists():
+        return hidden_size, vocab_size, acoustic_vae_dim, semantic_vae_dim
+
+    with safe_open(bundle_weights, framework="pt", device="cpu") as handle:
+        for key in WTE_KEYS:
+            if key in handle.keys():
+                wte = handle.get_tensor(key)
+                hidden_size = int(wte.shape[-1])
+                vocab_size = int(wte.shape[0])
+                break
+
+        acoustic_connector_key = ACOUSTIC_CONNECTOR_PREFIX + "fc1.weight"
+        if acoustic_connector_key in handle.keys():
+            connector = handle.get_tensor(acoustic_connector_key)
+            hidden_size = int(connector.shape[0])
+            acoustic_vae_dim = int(connector.shape[1])
+
+        semantic_connector_key = SEMANTIC_CONNECTOR_PREFIX + "fc1.weight"
+        if semantic_connector_key in handle.keys():
+            connector = handle.get_tensor(semantic_connector_key)
+            hidden_size = int(connector.shape[0])
+            semantic_vae_dim = int(connector.shape[1])
+
+    return hidden_size, vocab_size, acoustic_vae_dim, semantic_vae_dim
+
+
+def load_config(checkpoint_dir: Path) -> VibeVoiceASRConfig:
+    config_path = checkpoint_dir / "config.json"
+    if config_path.exists():
+        return VibeVoiceASRConfig.from_pretrained(checkpoint_dir)
+
+    hidden_size, vocab_size, acoustic_vae_dim, semantic_vae_dim = infer_bundle_config(checkpoint_dir)
+    config = VibeVoiceASRConfig()
+    config.decoder_config.hidden_size = hidden_size
+    if vocab_size is not None:
+        config.decoder_config.vocab_size = vocab_size
+    config.acoustic_tokenizer_config.vae_dim = acoustic_vae_dim
+    config.semantic_tokenizer_config.vae_dim = semantic_vae_dim
+    config.acoustic_vae_dim = acoustic_vae_dim
+    config.semantic_vae_dim = semantic_vae_dim
+    return config
 
 
 def load_audio_encoder(
@@ -334,54 +401,59 @@ def encode_speech_with_modules(
     return acoustic_features[speech_masks] + semantic_features[speech_masks]
 
 
-def tokenizer_source(args: argparse.Namespace) -> str:
+def tokenizer_source(args: argparse.Namespace, checkpoint_dir: Path | None = None) -> str:
     if args.tokenizer_path:
         return args.tokenizer_path
 
-    textonly_path = Path(args.textonly_model_path).expanduser()
-    if (textonly_path / "tokenizer.json").exists() or (textonly_path / "tokenizer_config.json").exists():
-        return str(textonly_path)
+    if checkpoint_dir is not None and (
+        (checkpoint_dir / "tokenizer.json").exists()
+        or (checkpoint_dir / "tokenizer_config.json").exists()
+    ):
+        return str(checkpoint_dir)
 
-    return args.language_model
+    bundle_path = Path(args.model_path).expanduser()
+    if (bundle_path / "tokenizer.json").exists() or (bundle_path / "tokenizer_config.json").exists():
+        return str(bundle_path)
+
+    return args.model_path
 
 
-def load_processor(args: argparse.Namespace) -> VibeVoiceASRProcessor:
-    source = tokenizer_source(args)
-    tokenizer = AutoTokenizer.from_pretrained(
-        source,
-        trust_remote_code=args.trust_remote_code,
-        local_files_only=args.local_files_only,
-    )
+def load_processor(args: argparse.Namespace, checkpoint_dir: Path) -> VibeVoiceASRProcessor:
+    source = tokenizer_source(args, checkpoint_dir)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            source,
+            trust_remote_code=args.trust_remote_code,
+            local_files_only=args.local_files_only,
+        )
+    except ValueError as exc:
+        if "Tokenizer class VibeVoiceASRTextTokenizer" not in str(exc):
+            raise
+        tokenizer = Qwen2TokenizerFast.from_pretrained(
+            source,
+            local_files_only=args.local_files_only,
+        )
     return VibeVoiceASRProcessor(tokenizer=tokenizer)
 
 
 def load_text_embedding_weight(
-    textonly_model_path: str,
     checkpoint_dir: Path,
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    textonly_path = Path(textonly_model_path).expanduser()
-    if (textonly_path / "model.safetensors").exists():
-        with safe_open(textonly_path / "model.safetensors", framework="pt", device="cpu") as handle:
-            return handle.get_tensor("model.embed_tokens.weight").to(device=device, dtype=dtype)
+    bundle_weights = checkpoint_dir / DEFAULT_AUDIO_ENCODER_FILE
+    if not bundle_weights.exists():
+        raise FileNotFoundError(f"Missing bundled audio weights: {bundle_weights}")
 
-    index_path = textonly_path / "model.safetensors.index.json"
-    if index_path.exists():
-        with index_path.open("r", encoding="utf-8") as handle:
-            weight_map = json.load(handle)["weight_map"]
-        key = "model.embed_tokens.weight"
-        shard_path = textonly_path / weight_map[key]
-        with safe_open(shard_path, framework="pt", device="cpu") as handle:
-            return handle.get_tensor(key).to(device=device, dtype=dtype)
+    with safe_open(bundle_weights, framework="pt", device="cpu") as handle:
+        for key in WTE_KEYS:
+            if key in handle.keys():
+                return handle.get_tensor(key).to(device=device, dtype=dtype)
 
-    asr_index_path = checkpoint_dir / "model.safetensors.index.json"
-    with asr_index_path.open("r", encoding="utf-8") as handle:
-        weight_map = json.load(handle)["weight_map"]
-    key = "model.language_model.embed_tokens.weight"
-    shard_path = checkpoint_dir / weight_map[key]
-    with safe_open(shard_path, framework="pt", device="cpu") as handle:
-        return handle.get_tensor(key).to(device=device, dtype=dtype)
+    raise KeyError(
+        f"{bundle_weights} does not contain an embedded WTE tensor. "
+        f"Tried: {', '.join(WTE_KEYS)}"
+    )
 
 
 def set_seed(seed: int, device: torch.device) -> None:
@@ -393,11 +465,9 @@ def set_seed(seed: int, device: torch.device) -> None:
 def build_prefix(args: argparse.Namespace) -> dict[str, Any]:
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
-    checkpoint_dir = resolve_checkpoint_dir(
-        args.model_path, args.local_files_only, revision=args.revision
-    )
-    config = VibeVoiceASRConfig.from_pretrained(checkpoint_dir)
-    processor = load_processor(args)
+    checkpoint_dir = resolve_checkpoint_dir(args.model_path, args.local_files_only)
+    config = load_config(checkpoint_dir)
+    processor = load_processor(args, checkpoint_dir)
 
     inputs = processor(
         audio=args.audio,
@@ -413,12 +483,7 @@ def build_prefix(args: argparse.Namespace) -> dict[str, Any]:
     speech_masks = inputs["speech_masks"].to(device)
 
     modules = load_audio_encoder(checkpoint_dir, config, device=device, dtype=dtype)
-    embedding_weight = load_text_embedding_weight(
-        args.textonly_model_path,
-        checkpoint_dir,
-        device=device,
-        dtype=dtype,
-    )
+    embedding_weight = load_text_embedding_weight(checkpoint_dir, device=device, dtype=dtype)
 
     with torch.inference_mode():
         set_seed(args.seed, device)
@@ -460,8 +525,7 @@ def build_prefix(args: argparse.Namespace) -> dict[str, Any]:
 
     metadata = {
         "source_model_path": str(args.model_path),
-        "textonly_model_path": str(args.textonly_model_path),
-        "tokenizer_path": tokenizer_source(args),
+        "tokenizer_path": tokenizer_source(args, checkpoint_dir),
         "audio_path": str(args.audio),
         "context_info": args.context_info or "",
         "sample_rate": 24000,
@@ -537,7 +601,8 @@ def compare_npz(exported: dict[str, Any], fixture_path: str, atol: float, rtol: 
 def build_demo_reference(args: argparse.Namespace) -> dict[str, np.ndarray]:
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
-    processor = load_processor(args)
+    checkpoint_dir = resolve_checkpoint_dir(args.model_path, args.local_files_only)
+    processor = load_processor(args, checkpoint_dir)
     inputs = processor(
         audio=args.audio,
         sampling_rate=None,
@@ -549,8 +614,8 @@ def build_demo_reference(args: argparse.Namespace) -> dict[str, np.ndarray]:
     inputs = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in inputs.items()}
 
     model = VibeVoiceASRForConditionalGeneration.from_pretrained(
-        args.model_path,
-        revision=args.revision,
+        args.reference_model_path,
+        revision=args.reference_revision,
         torch_dtype=dtype,
         attn_implementation=args.attn_implementation,
         trust_remote_code=True,
@@ -599,6 +664,8 @@ def main() -> None:
         ok = compare_npz(exported, args.compare_npz, args.atol, args.rtol) and ok
 
     if args.compare_demo_path:
+        if not args.reference_model_path:
+            raise SystemExit("--compare-demo-path requires --reference-model-path")
         print("--- comparing against full demo path ---")
         reference = build_demo_reference(args)
         for key in ("input_ids", "attention_mask", "acoustic_input_mask", "speech_masks"):

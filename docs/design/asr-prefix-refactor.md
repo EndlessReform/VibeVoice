@@ -86,8 +86,7 @@ asr-prefix-bundle/
   tokenizer_config.json
   chat_template.jinja
   processor_config.json
-  wte.safetensors
-  audio_encoder.safetensors
+  audio_encoder.safetensors      (includes WTE under original key)
   audio_encoder_config.json
 ```
 
@@ -106,10 +105,13 @@ asr-prefix-bundle/
     "pad": "<|box_start|>",
     "end": "<|object_ref_end|>"
   },
-  "wte_key": "model.embed_tokens.weight",
+  "default_bundle": "jkeisling/vibevoice-asr-encoder",
+  "wte_key": "model.language_model.embed_tokens.weight",
   "audio_encoder_weight_format": "hf-vibevoice-asr-audio-v1"
 }
 ```
+
+Note: `wte.safetensors` is no longer a separate file. The WTE tensor lives inside `audio_encoder.safetensors` under its original checkpoint key. Clients that need WTE for full prompt embeddings (Mode B) can load it from the audio encoder directly. Mode A (mixed prompt) clients still don't need WTE at all.
 
 The runtime client should load one immutable bundle version. The bundle records provenance; it should not ask the user to resolve a source checkpoint at runtime.
 
@@ -119,12 +121,15 @@ The runtime client should load one immutable bundle version. The bundle records 
 
 ### WTE Extraction
 
-`tools/extract_lm_trunk.py` already maps `model.language_model.embed_tokens.weight` to the standalone Qwen-style key `model.embed_tokens.weight`.
+`tools/extract_lm_trunk.py` extracts the WTE tensor (`model.language_model.embed_tokens.weight` for the current source checkpoint) and includes it in both outputs:
+- **LM trunk:** renamed to `model.embed_tokens.weight` for standalone Qwen2 compatibility
+- **Audio encoder:** preserved with its original checkpoint key
 
 **Key mapping:**
 ```
 source ASR key:  model.language_model.embed_tokens.weight
-bundle key:      model.embed_tokens.weight
+LM trunk key:    model.embed_tokens.weight          (Qwen2 standalone)
+audio_encoder key: model.language_model.embed_tokens.weight   (original preserved)
 ```
 
 For HF-format checkpoints, confirm the source key from the model index. In `transformers==5.10.2`, `lm_head.weight` is tied to `model.language_model.embed_tokens.weight`, so that is the expected source key.
@@ -134,7 +139,7 @@ For HF-format checkpoints, confirm the source key from the model index. In `tran
 **Recommended changes:**
 1. Add `tools/extract_asr_prefix_bundle.py`
 2. Add `--components wte,audio-encoder,tokenizer` so local experiments can build partial bundles
-3. Save WTE under a stable key and write metadata (source model, source commit, shape, dtype, SHA256)
+3. Keep WTE in audio_encoder with original key for clients building full prompt embeddings
 4. Keep `extract_lm_trunk.py` for full standalone decoder extraction, but stop pointing the prefix client at the full trunk by default
 5. For MLX or non-Python clients, also export an optional `wte.npz` or document the safetensors key and dtype so clients can read it directly
 6. Every split checkpoint that carries WTE or decoder weights — including the LM trunk — must also ship the merged `tokenizer.json` and `tokenizer_config.json` so it can be loaded with vanilla `AutoTokenizer` without re-merging against the base Qwen repo
@@ -193,9 +198,11 @@ The audio path includes:
 **Bundle contents:**
 ```
 audio_encoder.safetensors:
-  model.acoustic_tokenizer_encoder.*
-  model.semantic_tokenizer_encoder.*
-  model.multi_modal_projector.*
+  model.acoustic_tokenizer.*          (original keys preserved, no prefix stripping)
+  model.semantic_tokenizer.*
+  model.acoustic_connector.*
+  model.semantic_connector.*
+  model.language_model.embed_tokens.weight   (WTE, original key)
 
 audio_encoder_config.json:
   acoustic_tokenizer_encoder_config
@@ -206,6 +213,8 @@ audio_encoder_config.json:
   streaming_chunk_samples
   acoustic_sampling_mode
 ```
+
+**Key format:** As of the `extract_lm_trunk.py` refactor, audio encoder keys are preserved exactly as they appear in the source checkpoint — no `model.` prefix is stripped. The WTE tensor (`model.language_model.embed_tokens.weight` in the current source checkpoint) is also copied into `audio_encoder.safetensors` with its original key, so clients building full prompt embeddings can source it from the audio encoder without needing a separate WTE file.
 
 **Recommended Python API:**
 ```python
@@ -302,7 +311,7 @@ Done for this incremental refactor:
   creating and validating vendored tokenizer files.
 - Added `docs/development/asr-prefix-dev-workflow.md` with the tokenizer export,
   roundtrip check, and `flight.wav` fixture regeneration process.
-- Confirmed `out/textonly-checkpoint` carries the exported ASR tokenizer
+- Confirmed the exported ASR tokenizer
   manifest and can be loaded as a plain `Qwen2TokenizerFast`.
 - Removed the custom `VibeVoiceASRTextTokenizerFast` import from
   `tools/export_asr_prefix.py`; prefix export now loads tokenizer files through
@@ -314,6 +323,25 @@ Done for this incremental refactor:
 - Verified the `flight.wav` prefix exporter output is identical between the
   custom-tokenizer loader and the vanilla `AutoTokenizer` loader for
   `input_ids`, masks, audio features, and final `inputs_embeds`.
+
+### Completed: Audio-Only Bundle Runtime Increment (2026-06-05)
+
+Done for this incremental refactor:
+- Changed `tools/export_asr_prefix.py` and `tools/post_asr_prompt_embeds.py` to
+  default to `jkeisling/vibevoice-asr-encoder` as the ASR prefix bundle.
+- Removed runtime `--revision`, text-only checkpoint, and base language-model
+  fallback defaults from the prefix export/post path.
+- Fixed `tools/extract_lm_trunk.py` so the audio encoder split includes the
+  actual source WTE key (`model.language_model.embed_tokens.weight`) and fails
+  if no known WTE key exists.
+- Added bundle-only config inference from `audio_encoder.safetensors`, so a
+  local/remote bundle without `config.json` can instantiate the audio modules
+  from connector tensor shapes.
+- Updated `tools/export_asr_text_tokenizer.py` so future exported tokenizer
+  configs advertise `Qwen2TokenizerFast`.
+- Verified `out/audioonly-checkpoint` contains audio encoder weights, merged
+  tokenizer files, and embedded WTE, and can reproduce the `flight.wav` prefix
+  fixture exactly without reading the source ASR checkpoint or text-only split.
 
 ### Phase 0: Stop The Bleeding
 
@@ -426,7 +454,7 @@ Keep parity tests and runtime tests separate.
 5. The ASR special-token extension is done once at bundle-build time (`add_special_tokens()` + `save_pretrained()`). Runtime clients load the pre-baked tokenizer with vanilla `AutoTokenizer` or `tokenizers.Tokenizer`. No custom tokenizer class at runtime.
 6. Every split checkpoint (LM trunk, audio encoder, prefix bundle) ships its own copy of the merged tokenizer files. Consumers load them locally with `AutoTokenizer.from_pretrained(bundle_path)`, not by re-merging against the base Qwen repo.
 7. A bare client should use serialized tokenizer files plus manifest constants, not custom tokenizer class properties.
-6. The current exporter remains valuable as a parity oracle, but should stop being the implementation that `post_asr_prompt_embeds.py` depends on forever.
+8. The current exporter remains valuable as a parity oracle, but should stop being the implementation that `post_asr_prompt_embeds.py` depends on forever.
 
 ---
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-"""Extract the LM trunk and audio encoder from VibeVoice ASR checkpoint into separate safetensors files.
+"""Extract the LM trunk and audio encoder from VibeVoice ASR checkpoint into split safetensors files.
 
 Produces two standalone checkpoints:
   - lm_trunk.safetensors: Qwen2ForCausalLM weights for text-only downstream use
-  - audio_encoder.safetensors: acoustic/semantic tokenizers + connectors, for audio feature extraction
+  - audio_encoder.safetensors: acoustic/semantic tokenizers + connectors + WTE,
+    for portable ASR prefix construction
 """
 
 import argparse
@@ -11,6 +12,12 @@ import json
 from pathlib import Path
 
 from safetensors.torch import save_file
+
+
+WTE_SOURCE_KEYS = (
+    "model.language_model.embed_tokens.weight",
+    "model.language_model.model.embed_tokens.weight",
+)
 
 
 def parse_args():
@@ -32,6 +39,12 @@ def parse_args():
         "--output-dir",
         default="out",
         help="Directory to write output files.",
+    )
+    parser.add_argument(
+        "--split",
+        default="all",
+        choices=["audio", "lm", "all"],
+        help='Which checkpoint(s) to extract. Default "all".',
     )
     return parser.parse_args()
 
@@ -144,45 +157,51 @@ def main():
         if not (k.startswith("model.language_model.") or k == "lm_head.weight")
     }
 
+    # Include WTE in audio encoder with its original checkpoint key.
+    wte_key = next((key for key in WTE_SOURCE_KEYS if key in weight_map), None)
+    if wte_key is None:
+        raise RuntimeError(
+            "Could not find a language-model embedding tensor in the source "
+            f"checkpoint. Tried: {', '.join(WTE_SOURCE_KEYS)}"
+        )
+    audio_keys[wte_key] = weight_map[wte_key]
+
     print(f"Total keys: {len(weight_map)}")
     print(f"  LM trunk:     {len(lm_keys)} keys")
     print(f"  Audio encoder: {len(audio_keys)} keys")
     print()
 
-    # ---- LM trunk ----
-    print("=== LM TRUNK ===")
-    lm_state = load_tensors(checkpoint_dir, lm_keys)
-    lm_renamed = {rename_lm_key(k): v for k, v in lm_state.items()}
-    validate_lm_keys(lm_renamed)
-    save_checkpoint(
-        lm_renamed,
-        out_dir / "lm_trunk.safetensors",
-        metadata={
-            "extracted_from": "VibeVoice-ASR",
-            "description": "LM trunk (WTE + transformer layers + lm_head)",
-        },
-    )
+    if args.split in ("lm", "all"):
+        # ---- LM trunk ----
+        print("=== LM TRUNK ===")
+        lm_state = load_tensors(checkpoint_dir, lm_keys)
+        lm_renamed = {rename_lm_key(k): v for k, v in lm_state.items()}
+        validate_lm_keys(lm_renamed)
+        save_checkpoint(
+            lm_renamed,
+            out_dir / "lm_trunk.safetensors",
+            metadata={
+                "extracted_from": "VibeVoice-ASR",
+                "description": "LM trunk (WTE + transformer layers + lm_head)",
+            },
+        )
 
-    # ---- Audio encoder ----
-    print()
-    print("=== AUDIO ENCODER ===")
-    audio_state = load_tensors(checkpoint_dir, audio_keys)
-    # Strip model. prefix for standalone format
-    audio_renamed = {}
-    for k, v in audio_state.items():
-        new_k = k.removeprefix("model.")
-        audio_renamed[new_k] = v
-    save_checkpoint(
-        audio_renamed,
-        out_dir / "audio_encoder.safetensors",
-        metadata={
-            "extracted_from": "VibeVoice-ASR",
-            "description": (
-                "Audio encoder (acoustic_tokenizer + semantic_tokenizer + "
-                "acoustic_connector + semantic_connector)"
-            ),
-        },
-    )
+    if args.split in ("audio", "all"):
+        # ---- Audio encoder ----
+        print()
+        print("=== AUDIO ENCODER ===")
+        audio_state = load_tensors(checkpoint_dir, audio_keys)
+        save_checkpoint(
+            audio_state,
+            out_dir / "audio_encoder.safetensors",
+            metadata={
+                "extracted_from": "VibeVoice-ASR",
+                "description": (
+                    "Audio encoder (acoustic_tokenizer + semantic_tokenizer + "
+                    "acoustic_connector + semantic_connector + WTE)"
+                ),
+            },
+        )
 
 
 if __name__ == "__main__":

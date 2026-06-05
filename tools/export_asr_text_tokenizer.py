@@ -156,6 +156,18 @@ def _verify_tokenizer(tokenizer: Any) -> dict[str, int]:
     return ids
 
 
+def _write_vanilla_tokenizer_config(output_path: Path) -> None:
+    config_path = output_path / "tokenizer_config.json"
+    if not config_path.exists():
+        return
+
+    config = _load_json(config_path)
+    config["tokenizer_class"] = "Qwen2TokenizerFast"
+    with open(config_path, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+
+
 def export_tokenizer(
     model_path: str,
     output_dir: str,
@@ -187,12 +199,14 @@ def export_tokenizer(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     tokenizer.save_pretrained(output_path)
+    _write_vanilla_tokenizer_config(output_path)
 
     manifest = {
         "source_model_path": model_path,
         "language_model_pretrained_name": resolved_language_model,
         "tokenizer_source": tokenizer_source,
-        "tokenizer_class": "VibeVoiceASRTextTokenizerFast",
+        "tokenizer_class": "Qwen2TokenizerFast",
+        "created_with_tokenizer_class": "VibeVoiceASRTextTokenizerFast",
         "speech_token_ids": token_ids,
     }
     manifest_path = output_path / "vibevoice_asr_tokenizer_export.json"
