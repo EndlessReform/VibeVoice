@@ -2,6 +2,10 @@
 """
 Round-trip the exported VibeVoice-ASR tokenizer against the existing processor.
 
+This is intentionally one-off development tooling. It verifies the custom
+tokenizer path used to create vendored split-checkpoint tokenizer files, while
+runtime code loads those exported files with vanilla tokenizer APIs.
+
 Reference side:
     VibeVoiceASRProcessor + VibeVoiceASRTextTokenizerFast from transformers.
 

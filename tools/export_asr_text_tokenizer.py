@@ -2,6 +2,10 @@
 """
 Export the merged VibeVoice-ASR text tokenizer.
 
+This is intentionally one-off development tooling. Runtime split checkpoints
+should vendor the exported tokenizer files and load them with vanilla
+AutoTokenizer/tokenizers; they should not import the custom tokenizer class.
+
 This is a one-off helper for split deployments where the audio encoder runs
 outside the LM process. It follows the same tokenizer path as
 demo/vibevoice_asr_gradio_demo.py:

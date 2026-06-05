@@ -25,6 +25,9 @@ except ImportError:
 logger = logging.get_logger(__name__)
 
 SYSTEM_PROMPT = "You are a helpful assistant that transcribes audio input into text output in JSON format."
+ASR_SPEECH_START_TOKEN = "<|object_ref_start|>"
+ASR_SPEECH_END_TOKEN = "<|object_ref_end|>"
+ASR_SPEECH_PAD_TOKEN = "<|box_start|>"
 
 
 class VibeVoiceASRProcessor: 
@@ -70,21 +73,21 @@ class VibeVoiceASRProcessor:
     
     def _cache_special_tokens(self):
         """Cache special token IDs for efficiency."""
-        # Add safety checks for special tokens
-        if hasattr(self.tokenizer, 'speech_start_id'):
-            self.speech_start_id = self.tokenizer.speech_start_id
-        else:
-            self.speech_start_id = self.tokenizer.convert_tokens_to_ids("<|speech_start|>")
-            
-        if hasattr(self.tokenizer, 'speech_end_id'):
-            self.speech_end_id = self.tokenizer.speech_end_id
-        else:
-            self.speech_end_id = self.tokenizer.convert_tokens_to_ids("<|speech_end|>")
-            
-        if hasattr(self.tokenizer, 'speech_pad_id'):
-            self.speech_pad_id = self.tokenizer.speech_pad_id
-        else:
-            self.speech_pad_id = self.tokenizer.convert_tokens_to_ids("<|speech_pad|>")
+        self.speech_start_id = self._resolve_special_token_id(
+            "speech_start_id",
+            ASR_SPEECH_START_TOKEN,
+            "<|speech_start|>",
+        )
+        self.speech_end_id = self._resolve_special_token_id(
+            "speech_end_id",
+            ASR_SPEECH_END_TOKEN,
+            "<|speech_end|>",
+        )
+        self.speech_pad_id = self._resolve_special_token_id(
+            "speech_pad_id",
+            ASR_SPEECH_PAD_TOKEN,
+            "<|speech_pad|>",
+        )
             
         if hasattr(self.tokenizer, 'pad_id'):
             self.pad_id = self.tokenizer.pad_id
@@ -92,6 +95,26 @@ class VibeVoiceASRProcessor:
             self.pad_id = self.tokenizer.pad_token_id
         else:
             self.pad_id = self.tokenizer.convert_tokens_to_ids("<|endoftext|>")
+
+    def _resolve_special_token_id(self, attribute_name: str, *token_candidates: str) -> int:
+        if hasattr(self.tokenizer, attribute_name):
+            token_id = getattr(self.tokenizer, attribute_name)
+            if token_id is not None and token_id >= 0:
+                return int(token_id)
+
+        for token in token_candidates:
+            token_id = self.tokenizer.convert_tokens_to_ids(token)
+            if token_id is None or token_id < 0:
+                continue
+
+            decoded_token = self.tokenizer.convert_ids_to_tokens(token_id)
+            if decoded_token == token:
+                return int(token_id)
+
+        raise ValueError(
+            "Tokenizer is missing required ASR speech token. Tried: "
+            + ", ".join(token_candidates)
+        )
         
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):

@@ -13,6 +13,7 @@ import requests
 import torch
 
 from export_asr_prefix import (
+    DEFAULT_ASR_REVISION,
     DEFAULT_TEXTONLY_MODEL_PATH,
     build_prefix,
     default_model_path,
@@ -83,6 +84,11 @@ def parse_args() -> argparse.Namespace:
         help="HF repo id or local VibeVoice-ASR checkpoint directory.",
     )
     parser.add_argument(
+        "--revision",
+        default=DEFAULT_ASR_REVISION,
+        help="HF hub revision (commit hash, branch, or tag) for --model-path.",
+    )
+    parser.add_argument(
         "--textonly-model-path",
         default=str(DEFAULT_TEXTONLY_MODEL_PATH),
         help="Local text-only LM checkpoint containing tokenizer files and embeddings.",
@@ -95,7 +101,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--language-model",
         default="Qwen/Qwen2.5-7B",
-        help="Fallback base tokenizer when no local tokenizer directory is available.",
+        help=(
+            "Fallback tokenizer path when no local tokenizer directory is available. "
+            "For runtime prefix export this tokenizer must already include the ASR "
+            "speech tokens."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -136,6 +146,7 @@ def parse_args() -> argparse.Namespace:
 def make_export_args(args: argparse.Namespace) -> SimpleNamespace:
     return SimpleNamespace(
         model_path=args.model_path,
+        revision=args.revision,
         textonly_model_path=args.textonly_model_path,
         tokenizer_path=args.tokenizer_path,
         language_model=args.language_model,

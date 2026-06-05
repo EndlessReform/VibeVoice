@@ -9,11 +9,11 @@ from typing import Any
 import numpy as np
 import torch
 from safetensors import safe_open
+from transformers import AutoTokenizer
 
 from vibevoice.modular.configuration_vibevoice import VibeVoiceASRConfig
 from vibevoice.modular.modeling_vibevoice import SpeechConnector
 from vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRForConditionalGeneration
-from vibevoice.modular.modular_vibevoice_text_tokenizer import VibeVoiceASRTextTokenizerFast
 from vibevoice.modular.modular_vibevoice_tokenizer import (
     VibeVoiceAcousticTokenizerModel,
     VibeVoiceSemanticTokenizerModel,
@@ -23,10 +23,8 @@ from vibevoice.modular.modular_vibevoice_tokenizer import (
 from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
 
 
-DEFAULT_ASR_MODEL_SNAPSHOT = Path(
-    "~/.cache/huggingface/hub/models--microsoft--VibeVoice-ASR/"
-    "snapshots/d0c9efdb8d614685062c04425d91e01b6f37d944"
-).expanduser()
+DEFAULT_ASR_REPO = "microsoft/VibeVoice-ASR"
+DEFAULT_ASR_REVISION = "d0c9efdb8d614685062c04425d91e01b6f37d944"
 DEFAULT_TEXTONLY_MODEL_PATH = Path("out/textonly-checkpoint")
 ACOUSTIC_TOKENIZER_PREFIX = "model.acoustic_tokenizer."
 ACOUSTIC_CONNECTOR_PREFIX = "model.acoustic_connector."
@@ -35,9 +33,7 @@ SEMANTIC_CONNECTOR_PREFIX = "model.semantic_connector."
 
 
 def default_model_path() -> str:
-    if DEFAULT_ASR_MODEL_SNAPSHOT.exists():
-        return str(DEFAULT_ASR_MODEL_SNAPSHOT)
-    return "microsoft/VibeVoice-ASR"
+    return DEFAULT_ASR_REPO
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +48,11 @@ def parse_args() -> argparse.Namespace:
         "--model-path",
         default=default_model_path(),
         help="HF repo id or local VibeVoice-ASR checkpoint directory.",
+    )
+    parser.add_argument(
+        "--revision",
+        default=DEFAULT_ASR_REVISION,
+        help="HF hub revision (commit hash, branch, or tag).",
     )
     parser.add_argument(
         "--textonly-model-path",
@@ -72,7 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--language-model",
         default="Qwen/Qwen2.5-7B",
-        help="Fallback base tokenizer when no local tokenizer directory is available.",
+        help=(
+            "Fallback tokenizer path when no local tokenizer directory is available. "
+            "For runtime prefix export this tokenizer must already include the ASR "
+            "speech tokens."
+        ),
     )
     parser.add_argument(
         "--audio",
@@ -169,7 +174,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_checkpoint_dir(model_path: str, local_files_only: bool) -> Path:
+def resolve_checkpoint_dir(model_path: str, local_files_only: bool, revision: str = None) -> Path:
     path = Path(model_path).expanduser()
     if path.exists():
         return path
@@ -179,6 +184,7 @@ def resolve_checkpoint_dir(model_path: str, local_files_only: bool) -> Path:
     return Path(
         snapshot_download(
             repo_id=model_path,
+            revision=revision,
             allow_patterns=[
                 "config.json",
                 "model.safetensors.index.json",
@@ -341,7 +347,7 @@ def tokenizer_source(args: argparse.Namespace) -> str:
 
 def load_processor(args: argparse.Namespace) -> VibeVoiceASRProcessor:
     source = tokenizer_source(args)
-    tokenizer = VibeVoiceASRTextTokenizerFast.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
         source,
         trust_remote_code=args.trust_remote_code,
         local_files_only=args.local_files_only,
@@ -387,7 +393,9 @@ def set_seed(seed: int, device: torch.device) -> None:
 def build_prefix(args: argparse.Namespace) -> dict[str, Any]:
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
-    checkpoint_dir = resolve_checkpoint_dir(args.model_path, args.local_files_only)
+    checkpoint_dir = resolve_checkpoint_dir(
+        args.model_path, args.local_files_only, revision=args.revision
+    )
     config = VibeVoiceASRConfig.from_pretrained(checkpoint_dir)
     processor = load_processor(args)
 
@@ -542,6 +550,7 @@ def build_demo_reference(args: argparse.Namespace) -> dict[str, np.ndarray]:
 
     model = VibeVoiceASRForConditionalGeneration.from_pretrained(
         args.model_path,
+        revision=args.revision,
         torch_dtype=dtype,
         attn_implementation=args.attn_implementation,
         trust_remote_code=True,

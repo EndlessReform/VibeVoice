@@ -90,8 +90,11 @@ python demo/vibevoice_asr_inference_from_file.py --model_path microsoft/VibeVoic
 ### Usage 3: Export the ASR text tokenizer for split deployments
 
 For deployments that run the audio encoder separately from the LM-specific
-parts of the model, export the merged ASR text tokenizer once and load the
-saved tokenizer files in the LM process. This follows the same path used by
+parts of the model, export the merged ASR text tokenizer once while preparing a
+vendored checkpoint folder, then load the saved tokenizer files in the LM
+process with vanilla `AutoTokenizer` or `tokenizers.Tokenizer`. This is
+development tooling for creating those vendored folders, not runtime client
+code. It follows the same path used by
 `demo/vibevoice_asr_gradio_demo.py`: `VibeVoiceASRProcessor.from_pretrained(...)`
 loads `VibeVoiceASRTextTokenizerFast`, which applies the ASR speech-token merge
 implemented in `vibevoice/modular/modular_vibevoice_text_tokenizer.py`.
@@ -114,7 +117,12 @@ python tools/export_asr_text_tokenizer.py \
 The script only loads tokenizer assets; it does not load the ASR model weights.
 The exported tokenizer includes the ASR speech boundary and pad tokens used for
 audio placeholders: `<|object_ref_start|>`, `<|box_start|>`, and
-`<|object_ref_end|>`.
+`<|object_ref_end|>`. The local `out/textonly-checkpoint` folder is one example
+of this vendored output: its tokenizer manifest records the one-off export, and
+runtime prefix tooling now loads the serialized tokenizer files directly. For
+maintainer commands to export tokenizer files, verify the roundtrip, and
+regenerate `flight.wav` prefix fixtures, see
+`docs/development/asr-prefix-dev-workflow.md`.
 
 By default, the script resolves the language-model tokenizer from
 `preprocessor_config.json` when that file is present. If the released
