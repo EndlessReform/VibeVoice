@@ -4,9 +4,10 @@
 
 Replace the repo-local prefix export pipeline with a portable ASR prefix bundle that can be consumed by external clients (including future MLX ports) without importing this repository.
 
-**Current pipeline to replace:**
-- `tools/export_asr_prefix.py` — builds prefix by importing local `VibeVoiceASR*` classes
-- `tools/post_asr_prompt_embeds.py` — thin HTTP wrapper that delegates ML work back to `export_asr_prefix.py`
+**Current transitional pipeline:**
+- `tools/export_asr_prefix.py` — builds prefix tensors from an ASR prefix bundle by default, while still importing repo-local audio classes as a parity/runtime bridge
+- `tools/post_asr_prompt_embeds.py` — HTTP wrapper for full prompt embeddings, now pointed at the same ASR prefix bundle default
+- `tools/extract_lm_trunk.py` and `tools/export_asr_text_tokenizer.py` — bundle/split-checkpoint construction helpers
 
 **Target architecture:**
 ```
@@ -21,7 +22,7 @@ server:
   -> generate transcript
 ```
 
-The current scripts should become parity oracles and fixture generators. The runtime client should load a small, versioned, documented bundle.
+The current scripts are now halfway between runtime client and parity tooling. The remaining design work is to move the bundle runtime code into a small importable client that no longer imports this repository.
 
 ---
 
@@ -111,7 +112,7 @@ asr-prefix-bundle/
 }
 ```
 
-Note: `wte.safetensors` is no longer a separate file. The WTE tensor lives inside `audio_encoder.safetensors` under its original checkpoint key. Clients that need WTE for full prompt embeddings (Mode B) can load it from the audio encoder directly. Mode A (mixed prompt) clients still don't need WTE at all.
+Note: The WTE tensor lives inside `audio_encoder.safetensors` under its original checkpoint key. Clients that need WTE for full prompt embeddings (Mode B) can load it from the audio encoder directly. Mode A (mixed prompt) clients still don't need WTE at all.
 
 The runtime client should load one immutable bundle version. The bundle records provenance; it should not ask the user to resolve a source checkpoint at runtime.
 
@@ -136,13 +137,16 @@ For HF-format checkpoints, confirm the source key from the model index. In `tran
 
 **Size:** For the 7B decoder, WTE is ~1.0 GiB in bf16/fp16 (`152064 * 3584 * 2`). This is much smaller than the full decoder but not tiny. If the client can use vLLM's mixed text-token-plus-supplied-embedding path, it may not need WTE at all.
 
-**Recommended changes:**
-1. Add `tools/extract_asr_prefix_bundle.py`
-2. Add `--components wte,audio-encoder,tokenizer` so local experiments can build partial bundles
-3. Keep WTE in audio_encoder with original key for clients building full prompt embeddings
-4. Keep `extract_lm_trunk.py` for full standalone decoder extraction, but stop pointing the prefix client at the full trunk by default
-5. For MLX or non-Python clients, also export an optional `wte.npz` or document the safetensors key and dtype so clients can read it directly
-6. Every split checkpoint that carries WTE or decoder weights — including the LM trunk — must also ship the merged `tokenizer.json` and `tokenizer_config.json` so it can be loaded with vanilla `AutoTokenizer` without re-merging against the base Qwen repo
+**Implemented state:**
+- `tools/extract_lm_trunk.py --split audio` writes `audio_encoder.safetensors` with audio weights plus WTE under the original source key.
+- `tools/export_asr_prefix.py` and `tools/post_asr_prompt_embeds.py` default to the ASR prefix bundle instead of legacy split locations.
+- The audio-only bundle carries the merged tokenizer files needed by full prompt embedding clients.
+
+**Remaining work:**
+- Add a dedicated `tools/extract_asr_prefix_bundle.py` so bundle creation writes weights, tokenizer files, config, manifest, and README in one step.
+- Add `--components audio-encoder,tokenizer,metadata` for experiments that intentionally build partial bundles.
+- Document or export optional non-Python WTE formats if MLX or another runtime cannot read the safetensors tensor directly.
+- Keep `extract_lm_trunk.py` for standalone decoder extraction, but treat it as separate from prefix-bundle runtime.
 
 ### Tokenizer and Processor
 
@@ -150,9 +154,9 @@ The ASR special tokens (`<|object_ref_start|>`, `<|object_ref_end|>`, `<|box_sta
 
 **How the tokenizer is produced:**
 
-`tools/export_asr_text_tokenizer.py` loads the base Qwen tokenizer, calls `add_special_tokens()` to inject the ASR tokens, sets the chat template, and then calls `save_pretrained()`. This writes the extended vocabulary and added-token metadata into ordinary `tokenizer.json` / `tokenizer_config.json` files.
+`tools/export_asr_text_tokenizer.py` loads the base Qwen tokenizer through the repo-local ASR merge helper, injects the ASR tokens and chat template, calls `save_pretrained()`, then rewrites `tokenizer_config.json` to advertise `Qwen2TokenizerFast`. This writes the extended vocabulary and added-token metadata into ordinary `tokenizer.json` / `tokenizer_config.json` files.
 
-After that one-time export, every consumer loads it with vanilla tools:
+After that one-time export, consumers load it with vanilla tools:
 
 **HF Processor Mode (default for Torch/Transformers clients):**
 ```python
@@ -168,11 +172,13 @@ from tokenizers import Tokenizer
 tok = Tokenizer.from_file("bundle/tokenizer.json")
 ```
 
-The bundle must include:
+The current bundle includes:
 - `tokenizer.json`
 - `tokenizer_config.json`
-- `chat_template.jinja` (or the template string in `tokenizer_config.json`)
-- speech token strings and IDs in `bundle_config.json`
+- the chat template string in `tokenizer_config.json`
+- speech token strings and IDs in `vibevoice_asr_tokenizer_export.json`
+
+The final bundle manifest should also copy those speech token strings and IDs into `bundle_config.json`.
 
 Runtime code must not import `VibeVoiceASRTextTokenizerFast`. Read token IDs from the manifest or look them up with `convert_tokens_to_ids()`. Do not depend on custom class properties like `speech_start_id`.
 
@@ -193,7 +199,7 @@ The audio path includes:
 - connector projections into decoder hidden size
 - frame mask handling and shape checks
 
-`tools/export_audio_features_npz.py`, `export_asr_prefix.py`, and `vllm_plugin/model.py` currently duplicate large parts of this logic. Centralize it behind one API and one fixture suite before any MLX port.
+`tools/export_audio_features_npz.py`, `tools/export_asr_prefix.py`, and `vllm_plugin/model.py` currently duplicate large parts of this logic. The next runtime-client increment should centralize it behind one API and one fixture suite before any MLX port.
 
 **Bundle contents:**
 ```
@@ -204,7 +210,7 @@ audio_encoder.safetensors:
   model.semantic_connector.*
   model.language_model.embed_tokens.weight   (WTE, original key)
 
-audio_encoder_config.json:
+audio_encoder_config.json or bundle_config.json:
   acoustic_tokenizer_encoder_config
   semantic_tokenizer_encoder_config
   text_hidden_size
@@ -226,7 +232,7 @@ features = audio_encoder.encode(
 )
 ```
 
-For the first portable Torch client, use the Transformers implementation rather than repo-local audio classes. `VibeVoiceAsrModel.get_audio_features` is verified in `transformers==5.10.2`. The open engineering question is how to instantiate/load only `acoustic_tokenizer_encoder`, `semantic_tokenizer_encoder`, and `multi_modal_projector` without carrying decoder weights.
+For the first repo-local transitional client, `tools/export_asr_prefix.py` instantiates local audio modules and infers missing config values from `audio_encoder.safetensors`. For the portable Torch client, prefer the Transformers implementation if it can be loaded without decoder weights. `VibeVoiceAsrModel.get_audio_features` is verified in `transformers==5.10.2`; the open engineering question is whether that implementation exposes a stable audio-only load path.
 
 ---
 
@@ -341,27 +347,21 @@ Done for this incremental refactor:
   configs advertise `Qwen2TokenizerFast`.
 - Verified `out/audioonly-checkpoint` contains audio encoder weights, merged
   tokenizer files, and embedded WTE, and can reproduce the `flight.wav` prefix
-  fixture exactly without reading the source ASR checkpoint or text-only split.
+  fixture exactly from the bundle files.
 
-### Phase 0: Stop The Bleeding
-
-- Fix `post_asr_prompt_embeds.py` so it passes `revision` or so `build_prefix()` tolerates absent revision
-- Remove pinned revision as a default for arbitrary model IDs
-- Rename current scripts/docs to clarify their role: `export_asr_prefix.py` is a parity/export tool, not the future runtime client
-
-### Phase 1: Create The Bundle Builder
+### Next: Create The Bundle Builder
 
 Add `tools/extract_asr_prefix_bundle.py`. It should:
 - resolve a source model once
 - export tokenizer/processor files
-- export WTE-only weights
-- export audio encoder weights and config
+- export audio encoder weights with embedded WTE
+- export audio encoder/bundle config
 - write `bundle_config.json`
 - optionally create a README snippet showing both full-embeds and mixed-mode usage
 
-This replaces the expectation that a client points at `out/textonly-checkpoint`.
+This should replace the current manual sequence of `extract_lm_trunk.py --split audio` plus `export_asr_text_tokenizer.py`.
 
-### Phase 2: Split Runtime Code From Parity Code
+### Next: Split Runtime Code From Parity Code
 
 Create a small importable module:
 ```
@@ -382,9 +382,9 @@ embeds = bundle.build_prompt_embeds(request)
 payload = bundle.to_vllm_prompt_embeds_payload(embeds)
 ```
 
-The current `export_asr_prefix.py` should call this library and compare its output against the full demo/HF path.
+The current `export_asr_prefix.py` should call this library and compare its output against the full demo/HF path. `post_asr_prompt_embeds.py` should depend on this library directly rather than delegating through an exporter-shaped script.
 
-### Phase 3: Switch Torch Runtime To HF-First APIs
+### Next: Switch Torch Runtime To HF-First APIs Where Practical
 
 Replace local tokenizer/processor usage with:
 ```python
@@ -401,9 +401,9 @@ transformers==4.57.6: no
 transformers==5.10.2: yes
 ```
 
-Do not block the bundle on perfect removal of every local import for old-format checkpoints. It is fine for a legacy bundle builder to remain repo-aware temporarily. The runtime client is the piece that must be repo-independent.
+Do not block the bundle on perfect removal of every local import for old-format checkpoints. It is fine for bundle builders and parity oracles to remain repo-aware temporarily. The runtime client is the piece that must be repo-independent.
 
-### Phase 4: MLX Audio Encoder Port
+### Later: MLX Audio Encoder Port
 
 Port only after the Torch bundle client is stable.
 
@@ -429,8 +429,8 @@ Keep parity tests and runtime tests separate.
 **Runtime tests:**
 - Load a bundle from disk
 - Build prompt IDs and masks from tokenizer files
-- Load WTE-only weights
-- Load audio-encoder-only weights
+- Load embedded WTE from `audio_encoder.safetensors`
+- Load audio encoder weights from the same bundle
 - Produce full `inputs_embeds`
 - POST or serialize without requiring the full ASR checkpoint
 
@@ -447,7 +447,7 @@ Keep parity tests and runtime tests separate.
 
 ## Decisions
 
-1. WTE-only export is worth doing even though it is ~1 GiB for 7B.
+1. Embed WTE in `audio_encoder.safetensors` for full prompt embedding clients; do not publish a separate WTE artifact by default.
 2. The runtime bundle should vendor tokenizer/processor metadata and weights, then record source revisions as provenance.
 3. Runtime code should not import `vibevoice.*`.
 4. `AutoProcessor`/`apply_transcription_request` on `microsoft/VibeVoice-ASR-HF` with Transformers 5.10.2 is the verified tokenizer/processor path for Torch clients. Future Transformers versions should stay on this path, but CI should check it explicitly.
@@ -463,5 +463,5 @@ Keep parity tests and runtime tests separate.
 1. Does the current Transformers implementation expose a stable enough audio encoder submodule to load only audio weights without instantiating the full decoder?
 2. Should the portable bundle support stochastic acoustic sampling, mean-mode, or both? Mean-mode is easier for cross-runtime determinism, but may not match the official generation path.
 3. Should vLLM integration target full-prompt `prompt_embeds` first, then mixed-mode token IDs plus audio embeddings, or jump directly to mixed mode to avoid shipping WTE to clients?
-4. What is the acceptable client artifact size for macOS? WTE-only is much smaller than the full decoder but still large.
+4. What is the acceptable client artifact size for macOS? The audio encoder plus embedded WTE is much smaller than the full decoder but still about 3 GiB for the 7B bundle.
 5. Should non-Python clients emit PyTorch `torch.save` base64 for vLLM compatibility, or should the server grow a safetensors/NPY/raw tensor input?
