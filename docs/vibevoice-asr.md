@@ -119,10 +119,9 @@ The exported tokenizer includes the ASR speech boundary and pad tokens used for
 audio placeholders: `<|object_ref_start|>`, `<|box_start|>`, and
 `<|object_ref_end|>`. The local `out/textonly-checkpoint` folder is one example
 of this vendored output: its tokenizer manifest records the one-off export, and
-runtime prefix tooling now loads the serialized tokenizer files directly. For
-maintainer commands to export tokenizer files, verify the roundtrip, and
-regenerate `flight.wav` prefix fixtures, see
-`docs/development/asr-prefix-dev-workflow.md`.
+runtime prefix tooling now loads the serialized tokenizer files directly.
+For the current split ASR tooling, including the minimal audio encoder export
+and mixed vLLM `prompt_embeds` client, see `tools/README.md`.
 
 By default, the script resolves the language-model tokenizer from
 `preprocessor_config.json` when that file is present. If the released
